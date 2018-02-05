@@ -1,0 +1,463 @@
+\section{Исходный код}
+
+\begin{lstlisting}[language=C, mathescape]
+//TAudioSearch.h
+#pragma once 
+#define _USE_MATH_DEFINES
+#include <iostream>
+#include <string.h>
+#include <vector>
+#include <complex>
+#include <cmath>
+#include <fstream>
+#include <unordered_map>
+#include <map>
+#include <list>
+#include <valarray>  
+#include "mpg123.h"
+
+
+enum TErrorCode {
+    AS_OK,
+    AS_CANT_OPEN_FILE,
+    AS_FILE_CORRUPT,
+    AS_INITIALIZE_ERROR,
+    AS_ALLOCATE_ERROR, 
+    AS_NOT_FOUND
+};
+
+typedef std::complex<float> Complex;
+typedef std::valarray<Complex> CArray;
+const int32_t FUZ_FACTOR = 2;
+const int32_t UPPER_LIMIT = 300;
+const int32_t LOWER_LIMIT = 40;
+const int32_t RANGE[] = { LOWER_LIMIT, 80, 120, 180, UPPER_LIMIT + 1 };
+
+struct DataPoint {
+    int32_t songId;
+    int32_t time;
+};
+
+class TAudioSearch {
+    static std::unordered_map<int64_t, std::list<DataPoint>> hashMap;
+    static std::vector<std::string> songs;
+public:
+    int32_t CreateMusicBase(mpg123_handle* mh, std::string input, std::string output);
+    int32_t FindSongInBase(mpg123_handle* mh, std::string base, std::string intput, std::string output);
+
+private:
+    std::string songName;
+    bool searchMode;
+    int32_t songId;
+    size_t songLen;
+    std::unordered_map<int32_t, std::map<int32_t, int32_t>> matchMap;
+
+    int32_t DecodeAudioFile(mpg123_handle* mh);
+    int32_t MakeSpectrum(std::vector<float>& data);
+    int32_t DetermineKeyPoints(std::vector<CArray>& result);
+
+    int32_t Serialization(std::string output);
+    int32_t Deserialization(std::string input);
+    
+    void Fft(CArray& x);
+    int64_t Hash(int64_t p1, int64_t p2, int64_t p3, int64_t p4);
+    size_t GetIndex(int32_t freq);
+};
+\end{lstlisting}
+
+\begin{lstlisting}[language=C, mathescape]
+//TAudioSearch.cpp
+#include "TAudioSearch.h"
+
+std::unordered_map<int64_t, std::list<DataPoint>> TAudioSearch::hashMap;
+std::vector<std::string> TAudioSearch::songs;
+
+int32_t TAudioSearch::CreateMusicBase(mpg123_handle* mh, std::string input, std::string output) {
+    searchMode = false;
+    std::ifstream fin(input);
+    if (!fin)
+        return AS_CANT_OPEN_FILE;
+    while (std::getline(fin, songName)) {
+        songId = songs.size();
+        songs.push_back(songName);
+        if (DecodeAudioFile(mh) != AS_OK) {
+            std::cerr << "Error in file " << songName << std::endl;
+            songs.pop_back();
+        }
+    }
+    fin.close();
+    if (hashMap.empty())
+        std::cerr << "Base empty" << std::endl;
+    return Serialization(output);
+}
+
+int32_t TAudioSearch::FindSongInBase(mpg123_handle* mh, std::string base, std::string input, std::string output) {
+    searchMode = true;
+    int32_t stat = Deserialization(base);
+    if (stat != AS_OK)
+        return stat;
+    std::ifstream fin(input);
+    std::ofstream fout(output);
+    while (std::getline(fin, songName)) {
+        if (DecodeAudioFile(mh) != AS_OK) {
+            std::cerr << "Error in file '" << songName << "'" << std::endl;
+            continue;
+        }
+        int32_t bestCount = 0;
+        int32_t bestSong = -1;
+        for (int32_t id = songs.size() - 1; id >= 0; id--) {
+            auto tmpMap = matchMap.find(id);
+            int32_t bestCountForSong = 0;
+            if (tmpMap == matchMap.end())
+                continue;
+            for (auto entry : tmpMap->second) {
+                if (entry.second > bestCountForSong)
+                    bestCountForSong = entry.second;
+            }
+
+            if (bestCountForSong > bestCount) {
+                bestCount = bestCountForSong;
+                bestSong = id;
+            }
+        }
+        if (bestSong == -1 || (bestCount / (float)songLen) * 100 < 10)
+            fout << "! NOT FOUND " << std::endl;
+        else
+            fout << songs[bestSong] << std::endl;
+    }
+    fout.close();
+    fin.close();
+    return AS_OK;
+}
+
+int32_t TAudioSearch::Serialization(std::string output) {
+    std::ofstream fout(output);
+    if (!fout)
+        return AS_CANT_OPEN_FILE;
+    if (songs.empty()) {
+        std::cerr << "Base empty" << std::endl;
+        fout << 0;
+    }
+    else {
+        fout << songs.size() << ' ';
+        for (std::string i : songs)
+            fout << i << std::endl;
+        fout << hashMap.size() << ' ';
+        for (auto i : hashMap) {
+            fout << i.first << ' ';
+            fout << i.second.size() << ' ';
+            for (auto list : i.second) {
+                fout << list.songId << ' ' << list.time << ' ';
+            }
+        }
+    }
+    fout.close();
+    return AS_OK;
+}
+
+int32_t TAudioSearch::Deserialization(std::string input) {
+    std::ifstream fin(input);
+    if (!fin)
+        return AS_CANT_OPEN_FILE;
+    std::string str;
+    size_t size, sizeList;
+    int64_t hash;
+    int32_t songId, time;
+    std::list<DataPoint> buflist;
+    fin >> size;
+    if (!size) 
+        std::cerr << "Base empty" << std::endl;
+    else {
+        songs.resize(size);
+        fin.get();
+        for (size_t i = 0; i < size; i++)
+            std::getline(fin, songs[i]);
+        fin >> size;
+        hashMap.reserve(size);
+        for (size_t i = 0; i < size; i++) {
+            fin >> hash;
+            fin >> sizeList;
+            for (size_t j = 0; j < sizeList; j++) {
+                fin >> songId >> time;
+                buflist.push_back({ songId, time });
+            }
+            hashMap.insert(std::make_pair(hash, buflist));
+            buflist.clear();
+        }
+    }
+    fin.close();
+    return AS_OK;
+}
+
+void TAudioSearch::Fft(CArray& x) {
+    size_t N = x.size(), k = N, n;
+    float thetaT = (float)M_PI / N;
+    Complex phiT = Complex(cos(thetaT), -sin(thetaT)), T;
+    while (k > 1) {
+        n = k;
+        k >>= 1;
+        phiT = phiT * phiT;
+        T = 1.0L;
+        for (size_t l = 0; l < k; l++) {
+            for (size_t a = l; a < N; a += n) {
+                size_t b = a + k;
+                Complex t = x[a] - x[b];
+                x[a] += x[b];
+                x[b] = t * T;
+            }
+            T *= phiT;
+        }
+    }
+    size_t m = (size_t)log2(N);
+    for (size_t a = 0; a < N; a++) {
+        size_t b = a;
+        b = (((b & 0xaaaaaaaa) >> 1) | ((b & 0x55555555) << 1));
+        b = (((b & 0xcccccccc) >> 2) | ((b & 0x33333333) << 2));
+        b = (((b & 0xf0f0f0f0) >> 4) | ((b & 0x0f0f0f0f) << 4));
+        b = (((b & 0xff00ff00) >> 8) | ((b & 0x00ff00ff) << 8));
+        b = ((b >> 16) | (b << 16)) >> (32 - m);
+        if (b > a)
+        {
+            Complex t = x[a];
+            x[a] = x[b];
+            x[b] = t;
+        }
+    }
+}
+
+int32_t TAudioSearch::DecodeAudioFile(mpg123_handle* mh) {
+    size_t done;
+    int channels, encoding;
+    long rate;
+    size_t bufferSize = mpg123_outblock(mh);
+    unsigned char* ucBuffer = new unsigned char[bufferSize];
+    if (mpg123_open(mh, songName.c_str()) != MPG123_OK)
+        return AS_CANT_OPEN_FILE;
+    mpg123_getformat(mh, &rate, &channels, &encoding);
+    std::vector<float> data;
+    size_t doubleSize = sizeof(float);
+    float RC = 1.0f / (2000 * 2 * (float)M_PI);
+    float dt = 1.0f / 44100;
+    float alpha = dt / (RC + dt);
+    for (int totalBtyes = 0; mpg123_read(mh, ucBuffer, bufferSize, &done) == MPG123_OK; ) {
+        float* dBuffer = reinterpret_cast<float*>(ucBuffer);
+        size_t dataSize = bufferSize / doubleSize;
+        for (size_t i = 1; i < dataSize; i++)
+            dBuffer[i] = dBuffer[i - 1] + (alpha*(dBuffer[i] - dBuffer[i - 1]));
+        size_t i = 0;
+        for (; i + 4 <= dataSize; i += 4)
+            data.push_back((dBuffer[i] + dBuffer[i + 1] + dBuffer[i + 2] + dBuffer[i + 3]) / 4);
+        if (i > dataSize) {
+            i -= 4;
+            while (i < dataSize) {
+                data.push_back(dBuffer[i]);
+                i++;
+            }
+        }
+        totalBtyes += done;
+    }
+   
+    delete[] ucBuffer;
+    mpg123_close(mh);
+    return MakeSpectrum(data);
+}
+
+int32_t TAudioSearch::MakeSpectrum(std::vector<float>& data) {
+    const size_t ONE_CHANK_SIZE = 1024;
+    size_t totalSize = data.size();
+    size_t amountPossible = totalSize / ONE_CHANK_SIZE;
+
+    std::vector<CArray> result(amountPossible, CArray(ONE_CHANK_SIZE));
+
+    for (size_t times = 0; times < amountPossible; times++) {
+        for (size_t i = 0; i < ONE_CHANK_SIZE; i++) 
+            result[times][i] = data[(times * ONE_CHANK_SIZE) + i];
+        Fft(result[times]);
+        break;
+    }
+    data.clear();
+    return DetermineKeyPoints(result);
+}
+
+size_t TAudioSearch::GetIndex(int32_t freq) {
+    size_t i = 0;
+    while (RANGE[i] < freq) i++;
+    return i;
+}
+
+int64_t TAudioSearch::Hash(int64_t p1, int64_t p2, int64_t p3, int64_t p4) {
+    return (p4 - (p4 % FUZ_FACTOR)) * 100000000 
+         + (p3 - (p3 % FUZ_FACTOR)) * 100000
+         + (p2 - (p2 % FUZ_FACTOR)) * 100
+         + (p1 - (p1 % FUZ_FACTOR));
+}
+
+int32_t TAudioSearch::DetermineKeyPoints(std::vector<CArray>& result) {
+    songLen = result.size();
+    std::vector<std::vector<float>> highscores(songLen, std::vector<float>(5, 0));
+    std::vector<std::vector<int64_t>> points(songLen, std::vector<int64_t>(5, 0));
+    matchMap.clear();
+    for (size_t t = 0; t < songLen; t++) {
+        for (int freq = LOWER_LIMIT; freq < UPPER_LIMIT - 1; freq++) {
+            float mag = log(std::abs(result[t][freq]) + 1);
+            size_t index = GetIndex(freq);
+
+            if (mag > highscores[t][index]) {
+                highscores[t][index] = mag;
+                points[t][index] = freq;
+            }
+        }
+
+        int64_t h = Hash(points[t][0], points[t][1], points[t][2], points[t][3]);
+
+        if (searchMode) {
+            auto listPoints = hashMap.find(h);
+            if (listPoints != hashMap.end()) {
+                for (DataPoint& dP : listPoints->second) {
+                    int32_t offset = abs(dP.time - (int32_t)t);
+                    auto it2 = matchMap.find(dP.songId);
+                    if (it2 == matchMap.end()) {
+                        std::map<int32_t, int32_t> tmpMap;
+                        tmpMap.insert(std::make_pair(offset, 1));
+                        matchMap.insert(std::make_pair(dP.songId, tmpMap));
+                    }
+                    else {
+                        auto tmp = it2->second.find(offset);
+                        if (tmp == it2->second.end()) {
+                            it2->second.insert(std::make_pair(offset, 1));
+                        }
+                        else {
+                            int32_t count = tmp->second + 1;
+                            it2->second.erase(offset);
+                            it2->second.insert(std::make_pair(offset, count));
+                        }
+                    }
+                }
+            }
+        }
+        else {
+            std::list<DataPoint> listPoints;
+            auto it = hashMap.find(h);
+            if (it == hashMap.end()) {
+                listPoints.push_back({ songId, (int32_t)t });
+                hashMap.insert(std::make_pair(h, listPoints));
+            }
+            else
+                it->second.push_back({ songId, (int32_t)t });
+        }
+    }
+    return AS_OK;
+}
+
+
+\end{lstlisting}
+
+\begin{lstlisting}[language=C, mathescape]
+//main.cpp
+#include "TAudioSearch.h"
+
+void PrintUsage(const char* cProgName) {
+    std::cerr << "USAGE:" << cProgName << " index --input <input file> --output <index file>" << std::endl;
+    std::cerr << cProgName << " search --index <index file> --input <input file> --output <output file>" << std::endl;
+}
+
+void PrintError(int32_t errorCode) {
+    switch (errorCode) {
+    case AS_OK:
+        break;
+    case AS_CANT_OPEN_FILE:
+        std::cerr << "Could not open file" << std::endl;
+        break;
+    case AS_FILE_CORRUPT:
+        std::cerr << "File corrupt" << std::endl;
+        break;
+    case AS_INITIALIZE_ERROR:
+        std::cerr << "Resampler has not been properly initialized" << std::endl;
+        break;
+    case AS_ALLOCATE_ERROR:
+        std::cerr << "Could not allocate the frame" << std::endl;
+        break;
+    case AS_NOT_FOUND:
+        std::cerr << "Song not found" << std::endl;
+        break;
+    default:
+        std::cerr << "Unknown error" << std::endl;
+        break;
+    }
+}
+
+int main(int argc, char *argv[]) {
+    bool searchMode = false;
+    if (argc == 1) {
+        PrintUsage(argv[0]);
+        return 1;
+    }
+    else if (!strcmp(argv[1], "index")) {
+        if (argc < 6 || strcmp(argv[2], "--input") || strcmp(argv[4], "--output")) {
+            std::cerr << "Wrong parameters for 'index'" << std::endl;
+            PrintUsage(argv[0]);
+            return 1;
+        }
+    }
+    else if (!strcmp(argv[1], "search")) {
+        if (argc < 8 || strcmp(argv[2], "--index") || strcmp(argv[4], "--input") || strcmp(argv[6], "--output")) {
+            std::cerr << "Wrong parameters for 'search'" << std::endl;
+            PrintUsage(argv[0]);
+            return 1;
+        }
+        searchMode = true;
+    }
+    else {
+        std::cerr << "Wrong mode" << std::endl;
+        PrintUsage(argv[0]);
+        return 1;
+    }
+    TAudioSearch as;
+    mpg123_handle* mh = nullptr;
+    int32_t err = mpg123_init();
+    if (err != MPG123_OK || (mh = mpg123_new(nullptr, &err)) == nullptr){
+        PrintError(AS_INITIALIZE_ERROR);
+        return AS_INITIALIZE_ERROR;
+    }
+    long flags = MPG123_MONO_MIX | MPG123_QUIET | MPG123_FORCE_FLOAT;
+    if (mpg123_param(mh, MPG123_FLAGS, flags, 0) != MPG123_OK) {
+        PrintError(AS_INITIALIZE_ERROR);
+        return AS_INITIALIZE_ERROR;
+    }
+    mpg123_format_none(mh);
+    if (mpg123_format(mh, 44100, MPG123_MONO, MPG123_ENC_FLOAT) != MPG123_OK) {
+        PrintError(AS_INITIALIZE_ERROR);
+        return AS_INITIALIZE_ERROR;
+    }
+    PrintError(searchMode ? as.FindSongInBase(mh, argv[3], argv[5], argv[7]) : as.CreateMusicBase(mh, argv[3], argv[5]));
+    mpg123_delete(mh);
+    mpg123_exit();
+    return 0;
+}
+\end{lstlisting}
+\begin{lstlisting}[language=make]
+#makefile
+TARGET = DA_CP
+CC=g++
+FLAGS = -std=c++17 -Wall -pedantic -o2
+
+OBJ = main.o TAudioSearch.o
+
+.PHONY: all clean
+
+all: $(TARGET)
+
+clean:
+	rm -rf $(TARGET) *.o
+
+TAudioSearch.o: TAudioSearch.cpp TAudioSearch.h
+	$(CC) $(FLAGS) -c $< -o $@ -I./include
+main.o: main.cpp TAudioSearch.h
+	$(CC) $(FLAGS) -c $< -o $@ -I./include
+
+$(TARGET): $(OBJ)
+	$(CC) $(FLAGS) $(OBJ) -o $@ -L./lib -lmpg123
+
+
+\end{lstlisting}
+\pagebreak
